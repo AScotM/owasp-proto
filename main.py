@@ -65,7 +65,7 @@ class OwaspRiskMap:
                         x = float(row[x_col])
                         y = float(row[y_col])
                         risk = float(row[risk_col])
-                        category = row[category_col].strip() if len(row) > category_col else "UNKNOWN"
+                        category = row[category_col].strip()
                         self.findings.append(Finding(x, y, risk, category))
                     except (ValueError, IndexError) as e:
                         logger.warning(f"Line {row_num}: failed to parse - {e}")
@@ -113,11 +113,15 @@ class OwaspRiskMap:
         if power <= 0:
             raise ValueError(f"power must be positive, got {power}")
 
-    def _validate_max_points(self, max_points: Optional[int], total_points: int) -> None:
+    def _normalize_max_points(self, max_points: Optional[int], total_points: int) -> Optional[int]:
         if max_points is not None and max_points <= 0:
             raise ValueError(f"max_points must be positive, got {max_points}")
-        if max_points is not None and max_points > total_points:
+        if max_points is None:
+            return None
+        if max_points > total_points:
             logger.warning(f"max_points ({max_points}) exceeds available points ({total_points}), using all points")
+            return total_points
+        return max_points
 
     def idw_risk(
         self,
@@ -136,7 +140,7 @@ class OwaspRiskMap:
             logger.warning("No source points available for interpolation")
             return 0.0
 
-        self._validate_max_points(max_points, len(source))
+        effective_max_points = self._normalize_max_points(max_points, len(source))
 
         distances_and_risks = []
         
@@ -146,9 +150,9 @@ class OwaspRiskMap:
                 return finding.risk
             distances_and_risks.append((dist, finding.risk))
 
-        if max_points is not None and max_points < len(distances_and_risks):
+        if effective_max_points is not None and effective_max_points < len(distances_and_risks):
             distances_and_risks.sort(key=lambda item: item[0])
-            distances_and_risks = distances_and_risks[:max_points]
+            distances_and_risks = distances_and_risks[:effective_max_points]
 
         weighted_sum = 0.0
         total_weight = 0.0
@@ -178,34 +182,44 @@ class OwaspRiskMap:
         if not findings:
             return 0.0
             
-        k = len(findings)
-        if max_points is not None:
-            self._validate_max_points(max_points, len(findings))
-            k = min(max_points, len(findings))
+        effective_max_points = self._normalize_max_points(max_points, len(findings))
+        k = len(findings) if effective_max_points is None else effective_max_points
         
         distances, indices = tree.query([target_x, target_y], k=k)
         
-        if np.isscalar(distances):
-            if distances == 0:
-                return findings[indices].risk
-            weight = 1.0 / (distances ** power)
-            return weight * findings[indices].risk / weight
+        distances = np.atleast_1d(distances)
+        indices = np.atleast_1d(indices)
+        
+        for dist, idx in zip(distances, indices):
+            if dist == 0:
+                return findings[int(idx)].risk
             
         weighted_sum = 0.0
         total_weight = 0.0
         
         for dist, idx in zip(distances, indices):
-            if dist == 0:
-                return findings[idx].risk
             if dist > 0:
                 weight = 1.0 / (dist ** power)
-                weighted_sum += weight * findings[idx].risk
+                weighted_sum += weight * findings[int(idx)].risk
                 total_weight += weight
                 
         if total_weight == 0:
-            return sum(findings[idx].risk for idx in indices) / len(indices)
+            return sum(findings[int(idx)].risk for idx in indices) / len(indices)
             
         return weighted_sum / total_weight
+
+    def _create_folds(self, data: List[Finding], k_folds: int) -> List[List[Finding]]:
+        k_folds = min(k_folds, len(data))
+        fold_sizes = [len(data) // k_folds] * k_folds
+        for i in range(len(data) % k_folds):
+            fold_sizes[i] += 1
+        
+        folds = []
+        start = 0
+        for size in fold_sizes:
+            folds.append(data[start:start + size])
+            start += size
+        return folds
 
     def category_summary(self) -> Dict[str, Dict[str, Any]]:
         buckets: Dict[str, List[float]] = defaultdict(list)
@@ -240,11 +254,16 @@ class OwaspRiskMap:
             raise ValueError(f"block_size must be positive, got {block_size}")
 
         blocks: Dict[Tuple[int, int], List[float]] = defaultdict(list)
+        
+        max_bx = int((xmax - xmin) / block_size) - 1
+        max_by = int((ymax - ymin) / block_size) - 1
 
         for finding in self.findings:
             if xmin <= finding.x <= xmax and ymin <= finding.y <= ymax:
                 bx = int((finding.x - xmin) / block_size)
                 by = int((finding.y - ymin) / block_size)
+                bx = min(bx, max_bx)
+                by = min(by, max_by)
                 blocks[(bx, by)].append(finding.risk)
 
         averages = {}
@@ -295,11 +314,10 @@ class OwaspRiskMap:
         shuffled = self.findings[:]
         random.shuffle(shuffled)
         
-        folds = np.array_split(shuffled, k_folds)
+        folds = self._create_folds(shuffled, k_folds)
         errors = []
 
-        for i in range(len(folds)):
-            test_set = list(folds[i])
+        for i, test_set in enumerate(folds):
             train_set = []
             for j, fold in enumerate(folds):
                 if j != i:
@@ -373,7 +391,6 @@ class OwaspRiskMap:
     ) -> None:
         if random_seed is not None:
             random.seed(random_seed)
-            np.random.seed(random_seed)
             
         if categories is None:
             categories = [
