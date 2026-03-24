@@ -20,11 +20,16 @@ class Finding:
     category: str
 
 
+@dataclass
+class Prediction:
+    x: float
+    y: float
+    risk: float
+
+
 class OwaspRiskMap:
     def __init__(self) -> None:
         self.findings: List[Finding] = []
-        self._kdtree: Optional[KDTree] = None
-        self._kdtree_points: Optional[List[Tuple[float, float]]] = None
 
     def load_csv(
         self,
@@ -38,23 +43,23 @@ class OwaspRiskMap:
     ) -> None:
         if reset:
             self.findings = []
-            self._kdtree = None
-            self._kdtree_points = None
 
         try:
             with open(filename, "r", encoding="utf-8", newline="") as f:
                 reader = csv.reader(f)
+                start_line = 1
                 if has_header:
                     try:
                         next(reader)
+                        start_line = 2
                     except StopIteration:
                         logger.warning("Empty CSV file")
                         return
 
-                for row_num, row in enumerate(reader, start=1 if has_header else 0):
+                for row_num, row in enumerate(reader, start=start_line):
                     try:
                         if len(row) <= max(x_col, y_col, risk_col, category_col):
-                            logger.warning(f"Row {row_num}: insufficient columns, skipping")
+                            logger.warning(f"Line {row_num}: insufficient columns, skipping")
                             continue
                             
                         x = float(row[x_col])
@@ -63,10 +68,9 @@ class OwaspRiskMap:
                         category = row[category_col].strip() if len(row) > category_col else "UNKNOWN"
                         self.findings.append(Finding(x, y, risk, category))
                     except (ValueError, IndexError) as e:
-                        logger.warning(f"Row {row_num}: failed to parse - {e}")
+                        logger.warning(f"Line {row_num}: failed to parse - {e}")
                         continue
                         
-            self._build_kdtree()
             logger.info(f"Loaded {len(self.findings)} findings from {filename}")
             
         except FileNotFoundError:
@@ -76,27 +80,17 @@ class OwaspRiskMap:
             logger.error(f"Error loading CSV: {e}")
             raise
 
-    def save_csv(self, filename: str, predictions: List[Tuple[Tuple[float, float], float]]) -> None:
+    def save_csv(self, filename: str, predictions: List[Prediction]) -> None:
         try:
             with open(filename, "w", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["x", "y", "predicted_risk"])
-                for (x, y), risk in predictions:
-                    writer.writerow([x, y, risk])
+                for pred in predictions:
+                    writer.writerow([pred.x, pred.y, pred.risk])
             logger.info(f"Saved {len(predictions)} predictions to {filename}")
         except Exception as e:
             logger.error(f"Error saving CSV: {e}")
             raise
-
-    def _build_kdtree(self) -> None:
-        if not self.findings:
-            self._kdtree = None
-            self._kdtree_points = None
-            return
-            
-        points = [(f.x, f.y) for f in self.findings]
-        self._kdtree_points = points
-        self._kdtree = KDTree(points)
 
     def create_grid(self, xmin: float, xmax: float, ymin: float, ymax: float, resolution: int) -> Iterator[Tuple[float, float]]:
         if xmin >= xmax:
@@ -115,6 +109,16 @@ class OwaspRiskMap:
                 y = ymin + j * y_step
                 yield (x, y)
 
+    def _validate_power(self, power: int) -> None:
+        if power <= 0:
+            raise ValueError(f"power must be positive, got {power}")
+
+    def _validate_max_points(self, max_points: Optional[int], total_points: int) -> None:
+        if max_points is not None and max_points <= 0:
+            raise ValueError(f"max_points must be positive, got {max_points}")
+        if max_points is not None and max_points > total_points:
+            logger.warning(f"max_points ({max_points}) exceeds available points ({total_points}), using all points")
+
     def idw_risk(
         self,
         target_x: float,
@@ -123,6 +127,8 @@ class OwaspRiskMap:
         max_points: Optional[int] = None,
         source: Optional[List[Finding]] = None
     ) -> float:
+        self._validate_power(power)
+        
         if source is None:
             source = self.findings
 
@@ -130,8 +136,7 @@ class OwaspRiskMap:
             logger.warning("No source points available for interpolation")
             return 0.0
 
-        if max_points is not None and max_points <= 0:
-            raise ValueError(f"max_points must be positive, got {max_points}")
+        self._validate_max_points(max_points, len(source))
 
         distances_and_risks = []
         
@@ -159,43 +164,46 @@ class OwaspRiskMap:
 
         return weighted_sum / total_weight
 
-    def idw_risk_optimized(
+    def _idw_risk_with_tree(
         self,
         target_x: float,
         target_y: float,
+        findings: List[Finding],
+        tree: KDTree,
         power: int = 2,
         max_points: Optional[int] = None
     ) -> float:
-        if not self.findings:
+        self._validate_power(power)
+        
+        if not findings:
             return 0.0
             
-        if self._kdtree is None or self._kdtree_points is None:
-            self._build_kdtree()
-            
-        if max_points is None:
-            max_points = len(self.findings)
-            
-        distances, indices = self._kdtree.query([target_x, target_y], k=min(max_points, len(self.findings)))
+        k = len(findings)
+        if max_points is not None:
+            self._validate_max_points(max_points, len(findings))
+            k = min(max_points, len(findings))
+        
+        distances, indices = tree.query([target_x, target_y], k=k)
         
         if np.isscalar(distances):
             if distances == 0:
-                return self.findings[indices].risk
+                return findings[indices].risk
             weight = 1.0 / (distances ** power)
-            return weight * self.findings[indices].risk / weight
+            return weight * findings[indices].risk / weight
             
         weighted_sum = 0.0
         total_weight = 0.0
         
         for dist, idx in zip(distances, indices):
             if dist == 0:
-                return self.findings[idx].risk
+                return findings[idx].risk
             if dist > 0:
                 weight = 1.0 / (dist ** power)
-                weighted_sum += weight * self.findings[idx].risk
+                weighted_sum += weight * findings[idx].risk
                 total_weight += weight
                 
         if total_weight == 0:
-            return sum(self.findings[idx].risk for idx in indices) / len(indices)
+            return sum(findings[idx].risk for idx in indices) / len(indices)
             
         return weighted_sum / total_weight
 
@@ -282,34 +290,40 @@ class OwaspRiskMap:
         if k_folds <= 0:
             raise ValueError(f"k_folds must be positive, got {k_folds}")
 
-        k_folds = min(k_folds, len(self.findings))
+        self._validate_power(power)
+        
         shuffled = self.findings[:]
         random.shuffle(shuffled)
-
-        fold_size = max(1, len(shuffled) // k_folds)
+        
+        folds = np.array_split(shuffled, k_folds)
         errors = []
 
-        for fold in range(k_folds):
-            start = fold * fold_size
-            end = start + fold_size if fold < k_folds - 1 else len(shuffled)
-
-            test_set = shuffled[start:end]
-            train_set = shuffled[:start] + shuffled[end:]
-
-            for finding in test_set:
-                if use_optimized:
-                    temp_tree = self._kdtree
-                    temp_points = self._kdtree_points
-                    self.findings = train_set
-                    self._build_kdtree()
-                    predicted = self.idw_risk_optimized(finding.x, finding.y, power=power)
-                    self.findings = shuffled
-                    self._kdtree = temp_tree
-                    self._kdtree_points = temp_points
-                else:
-                    predicted = self.idw_risk(finding.x, finding.y, power=power, source=train_set)
-                    
-                errors.append((finding.risk - predicted) ** 2)
+        for i in range(len(folds)):
+            test_set = list(folds[i])
+            train_set = []
+            for j, fold in enumerate(folds):
+                if j != i:
+                    train_set.extend(fold)
+            
+            if not train_set:
+                logger.warning(f"Fold {i}: empty training set, skipping")
+                continue
+                
+            if use_optimized:
+                train_points = [(f.x, f.y) for f in train_set]
+                tree = KDTree(train_points)
+                
+                for finding in test_set:
+                    predicted = self._idw_risk_with_tree(
+                        finding.x, finding.y, train_set, tree, power=power
+                    )
+                    errors.append((finding.risk - predicted) ** 2)
+            else:
+                for finding in test_set:
+                    predicted = self.idw_risk(
+                        finding.x, finding.y, power=power, source=train_set
+                    )
+                    errors.append((finding.risk - predicted) ** 2)
 
         rmse = math.sqrt(sum(errors) / len(errors)) if errors else 0.0
         logger.info(f"Cross-validation RMSE: {rmse:.3f}")
@@ -325,16 +339,24 @@ class OwaspRiskMap:
         power: int = 2,
         max_points: Optional[int] = None,
         use_optimized: bool = False
-    ) -> List[Tuple[Tuple[float, float], float]]:
-        predictions = []
-        grid_points = list(self.create_grid(xmin, xmax, ymin, ymax, resolution))
+    ) -> List[Prediction]:
+        self._validate_power(power)
         
-        for x, y in grid_points:
-            if use_optimized:
-                risk = self.idw_risk_optimized(x, y, power=power, max_points=max_points)
-            else:
+        if use_optimized and self.findings:
+            train_points = [(f.x, f.y) for f in self.findings]
+            tree = KDTree(train_points)
+            
+            predictions = []
+            for x, y in self.create_grid(xmin, xmax, ymin, ymax, resolution):
+                risk = self._idw_risk_with_tree(
+                    x, y, self.findings, tree, power=power, max_points=max_points
+                )
+                predictions.append(Prediction(x, y, risk))
+        else:
+            predictions = []
+            for x, y in self.create_grid(xmin, xmax, ymin, ymax, resolution):
                 risk = self.idw_risk(x, y, power=power, max_points=max_points)
-            predictions.append(((x, y), risk))
+                predictions.append(Prediction(x, y, risk))
             
         logger.info(f"Generated {len(predictions)} predictions for grid {resolution}x{resolution}")
         return predictions
@@ -351,6 +373,7 @@ class OwaspRiskMap:
     ) -> None:
         if random_seed is not None:
             random.seed(random_seed)
+            np.random.seed(random_seed)
             
         if categories is None:
             categories = [
@@ -387,7 +410,6 @@ class OwaspRiskMap:
             category = random.choice(categories)
             self.findings.append(Finding(x, y, risk, category))
             
-        self._build_kdtree()
         logger.info(f"Generated {n_points} sample findings")
 
 
