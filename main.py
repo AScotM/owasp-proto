@@ -3,7 +3,7 @@ import math
 import random
 import logging
 from collections import defaultdict
-from typing import List, Tuple, Optional, Dict, Iterator, Any
+from typing import List, Tuple, Optional, Dict, Iterator, Any, Union
 from dataclasses import dataclass
 import numpy as np
 from scipy.spatial import KDTree
@@ -92,7 +92,14 @@ class OwaspRiskMap:
             logger.error(f"Error saving CSV: {e}")
             raise
 
-    def create_grid(self, xmin: float, xmax: float, ymin: float, ymax: float, resolution: int) -> Iterator[Tuple[float, float]]:
+    def create_grid(
+        self, 
+        xmin: float, 
+        xmax: float, 
+        ymin: float, 
+        ymax: float, 
+        resolution: int
+    ) -> Iterator[Tuple[float, float]]:
         if xmin >= xmax:
             raise ValueError(f"xmin ({xmin}) must be less than xmax ({xmax})")
         if ymin >= ymax:
@@ -190,9 +197,15 @@ class OwaspRiskMap:
         distances = np.atleast_1d(distances)
         indices = np.atleast_1d(indices)
         
+        # Check for exact matches
         for dist, idx in zip(distances, indices):
             if dist == 0:
-                return findings[int(idx)].risk
+                idx_int = int(idx)
+                if idx_int < len(findings):
+                    return findings[idx_int].risk
+                else:
+                    logger.warning(f"Index {idx_int} out of range for findings size {len(findings)}")
+                    return 0.0
             
         weighted_sum = 0.0
         total_weight = 0.0
@@ -200,16 +213,29 @@ class OwaspRiskMap:
         for dist, idx in zip(distances, indices):
             if dist > 0:
                 weight = 1.0 / (dist ** power)
-                weighted_sum += weight * findings[int(idx)].risk
-                total_weight += weight
+                idx_int = int(idx)
+                if idx_int < len(findings):
+                    weighted_sum += weight * findings[idx_int].risk
+                    total_weight += weight
                 
         if total_weight == 0:
-            return sum(findings[int(idx)].risk for idx in indices) / len(indices)
+            valid_risks = []
+            for idx in indices:
+                idx_int = int(idx)
+                if idx_int < len(findings):
+                    valid_risks.append(findings[idx_int].risk)
+            if valid_risks:
+                return sum(valid_risks) / len(valid_risks)
+            return 0.0
             
         return weighted_sum / total_weight
 
     def _create_folds(self, data: List[Finding], k_folds: int) -> List[List[Finding]]:
+        # Ensure k_folds doesn't exceed data size
         k_folds = min(k_folds, len(data))
+        if k_folds == 0:
+            return []
+            
         fold_sizes = [len(data) // k_folds] * k_folds
         for i in range(len(data) % k_folds):
             fold_sizes[i] += 1
@@ -221,7 +247,7 @@ class OwaspRiskMap:
             start += size
         return folds
 
-    def category_summary(self) -> Dict[str, Dict[str, Any]]:
+    def category_summary(self) -> Dict[str, Dict[str, Union[int, float]]]:
         buckets: Dict[str, List[float]] = defaultdict(list)
         
         for finding in self.findings:
@@ -255,15 +281,17 @@ class OwaspRiskMap:
 
         blocks: Dict[Tuple[int, int], List[float]] = defaultdict(list)
         
-        max_bx = int((xmax - xmin) / block_size) - 1
-        max_by = int((ymax - ymin) / block_size) - 1
+        # Fixed: Calculate maximum block indices correctly
+        max_bx = int((xmax - xmin) / block_size)
+        max_by = int((ymax - ymin) / block_size)
 
         for finding in self.findings:
             if xmin <= finding.x <= xmax and ymin <= finding.y <= ymax:
                 bx = int((finding.x - xmin) / block_size)
                 by = int((finding.y - ymin) / block_size)
-                bx = min(bx, max_bx)
-                by = min(by, max_by)
+                # Clamp indices to valid range
+                bx = min(bx, max_bx - 1) if bx >= max_bx else bx
+                by = min(by, max_by - 1) if by >= max_by else by
                 blocks[(bx, by)].append(finding.risk)
 
         averages = {}
@@ -310,6 +338,12 @@ class OwaspRiskMap:
             raise ValueError(f"k_folds must be positive, got {k_folds}")
 
         self._validate_power(power)
+        
+        # Ensure we don't have more folds than data points
+        k_folds = min(k_folds, len(self.findings))
+        if k_folds < 2:
+            logger.warning(f"Only {len(self.findings)} points available, using leave-one-out")
+            k_folds = len(self.findings)
         
         shuffled = self.findings[:]
         random.shuffle(shuffled)
