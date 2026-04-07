@@ -2,11 +2,13 @@ import csv
 import math
 import random
 import logging
+import heapq
 from collections import defaultdict
 from typing import List, Tuple, Optional, Dict, Iterator
 from dataclasses import dataclass, field
 import numpy as np
 from scipy.spatial import KDTree
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +93,87 @@ class PredictorContext:
     max_points: Optional[int]
     use_optimized: bool
     tree: Optional[KDTree] = None
+
+
+class IDWInterpolator:
+    def __init__(self, power: int = 2, max_points: Optional[int] = None):
+        self.power = power
+        self.max_points = max_points
+        self.tree: Optional[KDTree] = None
+        self.values: Optional[np.ndarray] = None
+        self.points: Optional[np.ndarray] = None
+
+    def fit(self, points: np.ndarray, values: np.ndarray) -> None:
+        if len(points) == 0:
+            self.tree = None
+            self.values = None
+            self.points = None
+            return
+        self.tree = KDTree(points)
+        self.values = values
+        self.points = points
+
+    def predict(self, targets: np.ndarray) -> np.ndarray:
+        if self.tree is None or self.values is None or len(self.values) == 0:
+            return np.zeros(len(targets))
+
+        effective_max_points = self.max_points if self.max_points is not None else len(self.values)
+        if effective_max_points > len(self.values):
+            effective_max_points = len(self.values)
+
+        k = effective_max_points
+        distances, indices = self.tree.query(targets, k=k)
+
+        if len(targets) == 1:
+            distances = np.atleast_1d(distances)
+            indices = np.atleast_1d(indices)
+
+        predictions = np.zeros(len(targets))
+
+        for i in range(len(targets)):
+            if k == 1:
+                dist = float(distances[i])
+                idx = int(indices[i])
+                if self._is_zero_distance(dist):
+                    predictions[i] = float(self.values[idx])
+                else:
+                    dist_safe = max(dist, 1e-8)
+                    weight = 1.0 / (dist_safe ** self.power)
+                    predictions[i] = weight * float(self.values[idx]) / weight
+            else:
+                dists = distances[i]
+                idxs = indices[i]
+                valid_pairs = []
+                for j in range(len(dists)):
+                    dist = float(dists[j])
+                    idx = int(idxs[j])
+                    if self._is_zero_distance(dist):
+                        predictions[i] = float(self.values[idx])
+                        break
+                    valid_pairs.append((dist, idx))
+                else:
+                    if not valid_pairs:
+                        predictions[i] = 0.0
+                        continue
+                    weighted_sum = 0.0
+                    total_weight = 0.0
+                    for dist, idx in valid_pairs:
+                        dist_safe = max(dist, 1e-8)
+                        weight = 1.0 / (dist_safe ** self.power)
+                        weighted_sum += weight * float(self.values[idx])
+                        total_weight += weight
+                    if total_weight == 0.0:
+                        predictions[i] = sum(float(self.values[idx]) for _, idx in valid_pairs) / len(valid_pairs)
+                    else:
+                        predictions[i] = weighted_sum / total_weight
+
+        return predictions
+
+    def predict_single(self, target_x: float, target_y: float) -> float:
+        return self.predict(np.array([[target_x, target_y]]))[0]
+
+    def _is_zero_distance(self, dist: float, eps: float = 1e-12) -> bool:
+        return abs(dist) <= eps
 
 
 class OwaspRiskMap:
@@ -296,14 +379,14 @@ class OwaspRiskMap:
             distances_and_risks.append((dist, finding.risk))
 
         if effective_max_points is not None and effective_max_points < len(distances_and_risks):
-            distances_and_risks.sort(key=lambda item: item[0])
-            distances_and_risks = distances_and_risks[:effective_max_points]
+            distances_and_risks = heapq.nsmallest(effective_max_points, distances_and_risks, key=lambda item: item[0])
 
         weighted_sum = 0.0
         total_weight = 0.0
 
         for dist, risk in distances_and_risks:
-            weight = 1.0 / (dist ** power)
+            dist_safe = max(dist, 1e-8)
+            weight = 1.0 / (dist_safe ** power)
             weighted_sum += weight * risk
             total_weight += weight
 
@@ -349,7 +432,8 @@ class OwaspRiskMap:
         total_weight = 0.0
 
         for dist, idx_int in valid_pairs:
-            weight = 1.0 / (dist ** power)
+            dist_safe = max(dist, 1e-8)
+            weight = 1.0 / (dist_safe ** power)
             weighted_sum += weight * findings[idx_int].risk
             total_weight += weight
 
@@ -376,7 +460,7 @@ class OwaspRiskMap:
         )
         return self._predict_with_context(context, target_x, target_y)
 
-    def _create_folds(self, data: List[Finding], k_folds: int) -> List[List[Finding]]:
+    def _create_folds(self, data: List[Finding], k_folds: int) -> List[List[int]]:
         if not data:
             return []
 
@@ -384,14 +468,15 @@ class OwaspRiskMap:
         if k_folds <= 0:
             return []
 
+        indices = list(range(len(data)))
         fold_sizes = [len(data) // k_folds] * k_folds
         for i in range(len(data) % k_folds):
             fold_sizes[i] += 1
 
-        folds: List[List[Finding]] = []
+        folds: List[List[int]] = []
         start = 0
         for size in fold_sizes:
-            folds.append(data[start:start + size])
+            folds.append(indices[start:start + size])
             start += size
         return folds
 
@@ -511,32 +596,48 @@ class OwaspRiskMap:
             logger.warning(f"Only {len(self.findings)} points available, using leave-one-out")
             effective_folds = len(self.findings)
 
-        shuffled = self.findings[:]
+        shuffled_indices = list(range(len(self.findings)))
         rng = random.Random(random_seed)
-        rng.shuffle(shuffled)
+        rng.shuffle(shuffled_indices)
 
-        folds = self._create_folds(shuffled, effective_folds)
+        folds = self._create_folds(shuffled_indices, effective_folds)
         squared_errors: List[float] = []
 
-        for i, test_set in enumerate(folds):
-            train_set = [finding for j, fold in enumerate(folds) if j != i for finding in fold]
+        for i, test_indices in enumerate(folds):
+            train_indices = [idx for j, fold in enumerate(folds) if j != i for idx in fold]
 
-            if not train_set:
+            if not train_indices:
                 logger.warning(f"Fold {i}: empty training set, skipping")
                 continue
 
-            context = self._build_predictor_context(
-                findings=train_set,
-                power=power,
-                max_points=max_points,
-                use_optimized=use_optimized,
-            )
+            train_findings = [self.findings[idx] for idx in train_indices]
 
-            for finding in test_set:
-                predicted = self._predict_with_context(context, finding.x, finding.y)
-                squared_errors.append((finding.risk - predicted) ** 2)
+            if use_optimized:
+                points = np.array([[f.x, f.y] for f in train_findings])
+                values = np.array([f.risk for f in train_findings])
+                interpolator = IDWInterpolator(power=power, max_points=max_points)
+                interpolator.fit(points, values)
+                for test_idx in test_indices:
+                    finding = self.findings[test_idx]
+                    predicted = interpolator.predict_single(finding.x, finding.y)
+                    squared_errors.append((finding.risk - predicted) ** 2)
+            else:
+                context = self._build_predictor_context(
+                    findings=train_findings,
+                    power=power,
+                    max_points=max_points,
+                    use_optimized=False,
+                )
+                for test_idx in test_indices:
+                    finding = self.findings[test_idx]
+                    predicted = self._predict_with_context(context, finding.x, finding.y)
+                    squared_errors.append((finding.risk - predicted) ** 2)
 
-        rmse = math.sqrt(sum(squared_errors) / len(squared_errors)) if squared_errors else 0.0
+        if not squared_errors:
+            rmse = 0.0
+        else:
+            rmse = math.sqrt(sum(squared_errors) / len(squared_errors))
+
         logger.info(f"Cross-validation RMSE: {rmse:.3f}")
 
         return CrossValidationResult(
@@ -547,6 +648,52 @@ class OwaspRiskMap:
             optimized=use_optimized,
         )
 
+    def optimize_power(self, k_folds: int = 5, use_optimized: bool = False, max_points: Optional[int] = None) -> int:
+        powers = range(1, 6)
+        best_power = 2
+        best_rmse = float('inf')
+        
+        for power in powers:
+            result = self.cross_validate(
+                power=power,
+                k_folds=k_folds,
+                use_optimized=use_optimized,
+                max_points=max_points
+            )
+            if result.rmse < best_rmse:
+                best_rmse = result.rmse
+                best_power = power
+        
+        logger.info(f"Optimal power selected: {best_power} (RMSE: {best_rmse:.3f})")
+        return best_power
+
+    def morans_i(self) -> Optional[float]:
+        if len(self.findings) < 2:
+            return None
+        
+        points = np.array([[f.x, f.y] for f in self.findings])
+        values = np.array([f.risk for f in self.findings])
+        
+        tree = KDTree(points)
+        n = len(values)
+        mean_val = np.mean(values)
+        
+        numerator = 0.0
+        denominator = 0.0
+        
+        for i in range(n):
+            denominator += (values[i] - mean_val) ** 2
+            distances, indices = tree.query(points[i], k=min(5, n))
+            for j in range(1, len(distances)):
+                if distances[j] > 0:
+                    weight = 1.0 / distances[j]
+                    numerator += weight * (values[i] - mean_val) * (values[indices[j]] - mean_val)
+        
+        if denominator == 0:
+            return None
+        
+        return (n / sum(1.0 / d for d in distances if d > 0)) * (numerator / denominator)
+
     def predict_grid(
         self,
         xmin: float,
@@ -556,25 +703,78 @@ class OwaspRiskMap:
         resolution: int,
         power: int = 2,
         max_points: Optional[int] = None,
-        use_optimized: bool = False
+        use_optimized: bool = False,
+        show_progress: bool = False
     ) -> List[Prediction]:
         bounds = self._validate_bounds(xmin, xmax, ymin, ymax)
         resolution = self._validate_resolution(resolution)
 
-        context = self._build_predictor_context(
-            findings=self.findings,
-            power=power,
-            max_points=max_points,
-            use_optimized=use_optimized,
-        )
-
-        predictions: List[Prediction] = []
-        for x, y in self.create_grid(bounds.xmin, bounds.xmax, bounds.ymin, bounds.ymax, resolution):
-            risk = self._predict_with_context(context, x, y)
-            predictions.append(Prediction(x, y, risk))
+        if use_optimized and self.findings:
+            points = np.array([[f.x, f.y] for f in self.findings])
+            values = np.array([f.risk for f in self.findings])
+            interpolator = IDWInterpolator(power=power, max_points=max_points)
+            interpolator.fit(points, values)
+            
+            grid_points = list(self.create_grid(bounds.xmin, bounds.xmax, bounds.ymin, bounds.ymax, resolution))
+            targets = np.array(grid_points)
+            predictions_array = interpolator.predict(targets)
+            
+            predictions = [Prediction(x, y, float(risk)) for (x, y), risk in zip(grid_points, predictions_array)]
+        else:
+            context = self._build_predictor_context(
+                findings=self.findings,
+                power=power,
+                max_points=max_points,
+                use_optimized=False,
+            )
+            
+            predictions: List[Prediction] = []
+            iterator = self.create_grid(bounds.xmin, bounds.xmax, bounds.ymin, bounds.ymax, resolution)
+            if show_progress:
+                total_points = (resolution + 1) ** 2
+                iterator = tqdm(iterator, total=total_points, desc="Generating predictions")
+            
+            for x, y in iterator:
+                risk = self._predict_with_context(context, x, y)
+                predictions.append(Prediction(x, y, risk))
 
         logger.info(f"Generated {len(predictions)} predictions for grid {resolution}x{resolution}")
         return predictions
+
+    def predict_grid_lazy(
+        self,
+        xmin: float,
+        xmax: float,
+        ymin: float,
+        ymax: float,
+        resolution: int,
+        power: int = 2,
+        max_points: Optional[int] = None,
+        use_optimized: bool = False
+    ) -> Iterator[Prediction]:
+        bounds = self._validate_bounds(xmin, xmax, ymin, ymax)
+        resolution = self._validate_resolution(resolution)
+
+        if use_optimized and self.findings:
+            points = np.array([[f.x, f.y] for f in self.findings])
+            values = np.array([f.risk for f in self.findings])
+            interpolator = IDWInterpolator(power=power, max_points=max_points)
+            interpolator.fit(points, values)
+            
+            for x, y in self.create_grid(bounds.xmin, bounds.xmax, bounds.ymin, bounds.ymax, resolution):
+                risk = interpolator.predict_single(x, y)
+                yield Prediction(x, y, risk)
+        else:
+            context = self._build_predictor_context(
+                findings=self.findings,
+                power=power,
+                max_points=max_points,
+                use_optimized=False,
+            )
+            
+            for x, y in self.create_grid(bounds.xmin, bounds.xmax, bounds.ymin, bounds.ymax, resolution):
+                risk = self._predict_with_context(context, x, y)
+                yield Prediction(x, y, risk)
 
     def generate_sample_data(
         self,
@@ -650,11 +850,18 @@ if __name__ == "__main__":
         print(f"X range: {stats.x_min:.3f} -> {stats.x_max:.3f}")
         print(f"Y range: {stats.y_min:.3f} -> {stats.y_max:.3f}")
 
+    moran = tool.morans_i()
+    if moran is not None:
+        print(f"Moran's I: {moran:.3f}")
+
     rmse = tool.cross_validate(power=2, k_folds=5, random_seed=42)
     print(f"Cross-validation RMSE: {rmse.rmse:.3f}")
 
     rmse_optimized = tool.cross_validate(power=2, k_folds=5, use_optimized=True, random_seed=42)
     print(f"Cross-validation RMSE (optimized): {rmse_optimized.rmse:.3f}")
+
+    optimal_power = tool.optimize_power(k_folds=5, use_optimized=True)
+    print(f"Optimal power: {optimal_power}")
 
     print("\nCategory summary:")
     for entry in tool.category_summary():
@@ -669,7 +876,7 @@ if __name__ == "__main__":
     block_entries = tool.block_average(0, 100, 0, 100, block_size=20.0)
     print(f"\nBlock averages: {len(block_entries)} populated blocks")
 
-    predictions = tool.predict_grid(0, 100, 0, 100, resolution=20, power=2, max_points=12)
+    predictions = tool.predict_grid(0, 100, 0, 100, resolution=20, power=2, max_points=12, show_progress=True)
     tool.save_csv("owasp_risk_predictions.csv", predictions)
 
     predictions_optimized = tool.predict_grid(
@@ -681,6 +888,7 @@ if __name__ == "__main__":
         power=2,
         max_points=12,
         use_optimized=True,
+        show_progress=True,
     )
     tool.save_csv("owasp_risk_predictions_optimized.csv", predictions_optimized)
 
